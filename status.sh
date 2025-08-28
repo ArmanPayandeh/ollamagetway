@@ -13,7 +13,7 @@ $DC -f "$COMPOSE_FILE" ps || true
 echo ""
 
 has() { docker ps -a --format '{{.Names}}' | grep -q "^$1$"; }
-run() { docker ps --format '{{.Names}}' | grep -q "^$1$"; }
+run() { docker ps   --format '{{.Names}}' | grep -q "^$1$"; }
 
 printf "%-16s : " "ollama"
 if has "ollama"; then
@@ -34,11 +34,13 @@ if run "ollama"; then
   echo "=== Ollama info ==="
   docker exec ollama sh -c "ollama --version" || true
   echo "- Models:"
-  docker exec ollama sh -c "ollama list || ollama ls || true" || true
+  docker exec ollama sh -c "ollama list || true" || true
 fi
 
 if [[ -n "${EXT_HOST:-}" && -n "${PROXY_PORT:-}" ]]; then
   scheme="http"; [[ "${ENABLE_TLS:-0}" -eq 1 ]] && scheme="https"
   echo ""
-  echo "Gateway: ${scheme}://$EXT_HOST:$PROXY_PORT/ollama  (requires Authorization: Bearer <token>)"
+  echo "Gateway: ${scheme}://$EXT_HOST:$PROXY_PORT/ollama  (Authorization: Bearer <token>)"
+  echo "Port bindings:"
+  docker inspect -f '{{json .NetworkSettings.Ports}}' ollama-proxy 2>/dev/null || true
 fi
