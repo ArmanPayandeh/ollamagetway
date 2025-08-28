@@ -1,0 +1,15 @@
+{
+  "id": "ollama-secure",
+  "name": "Ollama (Secure Gateway)",
+  "version": "1.0.0",
+  "description": "Run Ollama behind a secure Bearer-token gateway with optional GPU and model pre-pull. Includes install/start/stop/status/uninstall scripts.",
+  "author": "Your Team",
+  "homepage": "https://fx.land/",
+  "entrypoints": {
+    "install": "install.sh",
+    "start": "start.sh",
+    "stop": "stop.sh",
+    "status": "status.sh",
+    "uninstall": "uninstall.sh"
+  }
+}
