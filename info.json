@@ -1,10 +1,9 @@
 {
   "id": "ollama-secure",
-  "name": "Ollama (Secure Gateway)",
-  "version": "1.0.2",
-  "description": "Run Ollama behind a secure Bearer-token gateway (Nginx). Optional GPU and model pre-pull. Includes install/start/stop/status/uninstall scripts.",
-  "author": "Your Team",
-  "homepage": "https://fx.land/",
+  "name": "Ollama Secure Gateway",
+  "version": "1.1.0",
+  "description": "Secure Nginx gateway for Ollama with API key/Bearer auth, OpenAI-compatible /v1 endpoints, optional TLS & GPU, and clean lifecycle scripts.",
+  "author": "you",
   "entrypoints": {
     "install": "install.sh",
     "start": "start.sh",
