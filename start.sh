@@ -41,7 +41,6 @@ if [[ "$ROTATE" -eq 1 ]]; then
     API_KEY="$(head -c 64 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 64)"
   fi
   sed -i "s/^API_KEY=.*/API_KEY=$API_KEY/" "$ENV_FILE"
-  # update nginx.conf map
   api_key_escaped="$(printf '%s' "$API_KEY" | sed -e 's/[\/&]/\\&/g')"
   sed -i "s/map \$auth_token \$is_authorized {[^}]*}/map \$auth_token \$is_authorized {\n    default 0;\n    $api_key_escaped 1;\n  }/g" "$PLUGIN_DIR/nginx.conf"
 fi
@@ -53,7 +52,7 @@ else
   $DC -f "$COMPOSE_FILE" up -d ollama proxy
 fi
 
-# wait for Ollama to be ready (max ~30s)
+# wait for Ollama to be ready
 echo "• Waiting for ollama service to be ready..."
 for i in {1..30}; do
   if docker exec ollama sh -c "ollama --version" &>/dev/null; then break; fi
