@@ -22,12 +22,12 @@ else
   $DC -f "$COMPOSE_FILE" rm -s -f "$TARGET" || true
 fi
 
-echo "Remove data as well? (models are large) [y/N]"
+echo "Remove data (downloaded models are large)? [y/N]"
 read -r ans
 if [[ "$ans" =~ ^[Yy]$ ]]; then
   case "$TARGET" in
     "ollama") sudo rm -rf "$DATA_DIR/ollama";;
-    "proxy")  echo "No data for proxy.";;
+    "proxy")  echo "No proxy data to remove.";;
     "all")    sudo rm -rf "$DATA_DIR";;
   esac
 fi
