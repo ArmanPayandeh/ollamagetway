@@ -1,7 +1,7 @@
 {
   "id": "ollama-secure",
   "name": "Ollama (Secure Gateway)",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Run Ollama behind a secure Bearer-token gateway (Nginx). Optional GPU and model pre-pull. Includes install/start/stop/status/uninstall scripts.",
   "author": "Your Team",
   "homepage": "https://fx.land/",
