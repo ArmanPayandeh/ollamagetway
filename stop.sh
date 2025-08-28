@@ -10,7 +10,7 @@ usage(){ echo "Usage: ./stop.sh [ollama|proxy|all]  (default: all)"; }
 
 case "${1:-all}" in
   "ollama") $DC -f "$COMPOSE_FILE" stop ollama || true;;
-  "proxy")  $DC -f "$COMPOSE_FILE" stop proxy || true;;
+  "proxy")  $DC -f "$COMPOSE_FILE" stop proxy  || true;;
   "all")    $DC -f "$COMPOSE_FILE" stop || true;;
   *) usage; exit 1;;
 esac
