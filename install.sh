@@ -1,155 +1,78 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ===== Paths =====
-PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="$PLUGIN_DIR/.env"
-COMPOSE_FILE="$PLUGIN_DIR/compose.yaml"
-NGINX_CONF="$PLUGIN_DIR/nginx.conf"
-DATA_DIR="$PLUGIN_DIR/data"
-OLLAMA_DATA="$DATA_DIR/ollama"
+# ========= Paths =========
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV="$ROOT/.env"
+COMPOSE="$ROOT/docker-compose.yml"
+NGINX_CONF="$ROOT/nginx.conf"
+APIKEYS="$ROOT/apikeys.conf"
+DATA_DIR="$ROOT/data/ollama"
 
-# ===== Requirements =====
-REQ_CMDS=(docker awk sed grep cut tr head)
-OPT_CMDS=(jq qrencode openssl)
-DC="docker compose"
-if ! command -v docker &>/dev/null; then
-  echo "✖ Docker is not installed. Please install Docker Engine."; exit 1
-fi
-$DC version &>/dev/null || { command -v docker-compose &>/dev/null && DC="docker-compose" || { echo "✖ neither 'docker compose' nor 'docker-compose' found."; exit 1; }; }
+# ========= Checks =========
+need() { command -v "$1" >/dev/null 2>&1 || { echo "✖ required: $1"; exit 1; }; }
+need docker
+if docker compose version >/dev/null 2>&1; then DC="docker compose"; else need docker-compose; DC="docker-compose"; fi
 
-missing_opt=()
-for c in "${OPT_CMDS[@]}"; do command -v "$c" >/dev/null 2>&1 || missing_opt+=("$c"); done
-if ((${#missing_opt[@]})); then
-  echo "• Optional tools missing: ${missing_opt[*]}"
-  if command -v apt-get &>/dev/null; then
-    echo "→ Trying to install (Debian/Ubuntu)..."
-    sudo apt-get update -y
-    sudo apt-get install -y jq qrencode openssl || true
-  fi
+# optional tools
+for t in jq qrencode openssl; do command -v "$t" >/dev/null 2>&1 || MISSING="$MISSING $t"; done
+if [[ -n "${MISSING:-}" ]] && command -v apt-get >/dev/null 2>&1; then
+  echo "• installing optional tools:${MISSING}"
+  sudo apt-get update -y && sudo apt-get install -y jq qrencode openssl || true
 fi
 
-mkdir -p "$OLLAMA_DATA"
+mkdir -p "$DATA_DIR"
 
-# ===== Interactive config =====
-read -rp "Secure gateway port (Nginx)? [8999]: " PROXY_PORT
-PROXY_PORT="${PROXY_PORT:-8999}"
-
-read -rp "External host (IP/domain for URL/QR)? [auto]: " EXT_HOST
-if [[ -z "${EXT_HOST:-}" ]]; then
-  EXT_HOST="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  [[ -z "$EXT_HOST" ]] && EXT_HOST="127.0.0.1"
-fi
-
-read -rp "CORS Origin (single or comma-separated, e.g., http://localhost:3000 or * for all)? [*]: " ALLOWED_ORIGINS
-ALLOWED_ORIGINS="${ALLOWED_ORIGINS:-*}"
-
-read -rp "Enable TLS? (do you have your own certificate) [y/N]: " enable_tls
-ENABLE_TLS=0
-TLS_CERT_PATH=""
-TLS_KEY_PATH=""
-if [[ "$enable_tls" =~ ^[Yy]$ ]]; then
-  ENABLE_TLS=1
-  read -rp "Path to cert file (e.g., /etc/ssl/certs/fullchain.pem): " TLS_CERT_PATH
-  read -rp "Path to key  file (e.g., /etc/ssl/private/privkey.pem): " TLS_KEY_PATH
-  if [[ ! -f "$TLS_CERT_PATH" || ! -f "$TLS_KEY_PATH" ]]; then
-    echo "⚠ TLS disabled: provided cert/key not found."
-    ENABLE_TLS=0
-    TLS_CERT_PATH=""; TLS_KEY_PATH=""
-  fi
+# ========= Interactive cfg =========
+read -rp "Public port (gateway): [8999] " PROXY_PORT; PROXY_PORT="${PROXY_PORT:-8999}"
+read -rp "External host/IP for clients (for info only): [auto] " EXT_HOST
+if [[ -z "${EXT_HOST:-}" ]]; then EXT_HOST="$(hostname -I 2>/dev/null | awk '{print $1}')" || true; EXT_HOST="${EXT_HOST:-127.0.0.1}"; fi
+read -rp "Allowed CORS origins (comma or *): [*] " ALLOWED; ALLOWED="${ALLOWED:-*}"
+read -rp "Enable TLS with your cert/key? [y/N] " ans
+ENABLE_TLS=0; CERT=""; KEY=""
+if [[ "$ans" =~ ^[Yy]$ ]]; then
+  read -rp "Path to cert (fullchain): " CERT
+  read -rp "Path to key  (privkey): " KEY
+  if [[ -f "$CERT" && -f "$KEY" ]]; then ENABLE_TLS=1; else echo "⚠ cert/key not found, TLS disabled."; fi
 fi
 
 # GPU
-ENABLE_GPU=0
-if command -v nvidia-smi &>/dev/null; then
-  read -rp "Enable GPU (NVIDIA)? [y/N]: " ans
-  [[ "$ans" =~ ^[Yy]$ ]] && ENABLE_GPU=1
+USE_GPU=0
+if command -v nvidia-smi >/dev/null 2>&1; then
+  read -rp "Enable NVIDIA GPU? [y/N] " g; [[ "$g" =~ ^[Yy]$ ]] && USE_GPU=1
 fi
 
-# Pre-pull models
-read -rp "List of models to pre-pull (space-separated, e.g., 'llama3:8b mistral:7b')? [empty=none]: " PULL_MODELS
-PULL_MODELS="${PULL_MODELS:-}"
-
-# Bearer token
-if [[ -f "$ENV_FILE" && -s "$ENV_FILE" && "$(grep -c '^API_KEY=' "$ENV_FILE" || true)" -gt 0 ]]; then
-  API_KEY="$(grep '^API_KEY=' "$ENV_FILE" | cut -d'=' -f2-)"
-else
-  if command -v openssl &>/dev/null; then
-    API_KEY="$(openssl rand -hex 32)"
-  else
-    API_KEY="$(head -c 64 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 64)"
-  fi
-fi
-
-# Build CORS regex (for non-*)
-CORS_MODE="STAR"
-CORS_REGEX=""
-if [[ "$ALLOWED_ORIGINS" != "*" ]]; then
-  CORS_MODE="LIST"
-  IFS=',' read -r -a ORIG_ARR <<<"${ALLOWED_ORIGINS}"
-  esc_list=()
-  for o in "${ORIG_ARR[@]}"; do
-    o_trim="$(echo "$o" | xargs)"
-    [[ -z "$o_trim" ]] && continue
-    esc="$(printf '%s' "$o_trim" | sed -e 's/[]\/$*.^|[]/\\&/g')"
-    esc_list+=("$esc")
-  done
-  CORS_REGEX="$(IFS="|"; echo "${esc_list[*]}")"
-fi
-
-# ===== Write .env =====
-cat >"$ENV_FILE" <<EOF
-# Generated by install.sh (v1.0.2)
+# ========= .env =========
+cat > "$ENV" <<EOF
 EXT_HOST=$EXT_HOST
 PROXY_PORT=$PROXY_PORT
-API_KEY=$API_KEY
+ALLOWED_ORIGINS=$ALLOWED
 ENABLE_TLS=$ENABLE_TLS
-TLS_CERT_PATH=$TLS_CERT_PATH
-TLS_KEY_PATH=$TLS_KEY_PATH
-ALLOWED_ORIGINS=$ALLOWED_ORIGINS
-ENABLE_GPU=$ENABLE_GPU
-PULL_MODELS=$PULL_MODELS
+TLS_CERT_PATH=$CERT
+TLS_KEY_PATH=$KEY
+USE_GPU=$USE_GPU
 OLLAMA_PORT=11434
 EOF
-echo "• Saved: $ENV_FILE"
+echo "• wrote $ENV"
 
-# ===== Write compose.yaml =====
-GPU_SNIPPET=""
-if [[ "$ENABLE_GPU" -eq 1 ]]; then
-  GPU_SNIPPET="    gpus: all"
-fi
-
+# ========= docker-compose.yml =========
 if [[ "$ENABLE_TLS" -eq 1 ]]; then
-  MAP_PORT_LINE="      - \"\${PROXY_PORT}:8443\""
+  MAP_PORT="      - \"\${PROXY_PORT}:8443\""
   TLS_MOUNTS="      - \${TLS_CERT_PATH}:/etc/ssl/certs/ollama.crt:ro
       - \${TLS_KEY_PATH}:/etc/ssl/private/ollama.key:ro"
 else
-  MAP_PORT_LINE="      - \"\${PROXY_PORT}:8080\""
+  MAP_PORT="      - \"\${PROXY_PORT}:8080\""
   TLS_MOUNTS=""
 fi
 
-cat >"$COMPOSE_FILE" <<YAML
+GPU_LINE=""
+if [[ "$USE_GPU" -eq 1 ]]; then
+  GPU_LINE="    gpus: all"
+fi
+
+cat > "$COMPOSE" <<YAML
 name: ollama-secure
 services:
-  proxy:
-    image: nginx:1.25-alpine
-    container_name: ollama-proxy
-    ports:
-$MAP_PORT_LINE
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./data:/data:ro
-$TLS_MOUNTS
-    environment:
-      - API_KEY=\${API_KEY}
-      - EXT_HOST=\${EXT_HOST}
-      - ALLOWED_ORIGINS=\${ALLOWED_ORIGINS}
-      - ENABLE_TLS=\${ENABLE_TLS}
-    depends_on:
-      - ollama
-    restart: unless-stopped
-    networks: [ollamanet]
-
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
@@ -160,156 +83,154 @@ $TLS_MOUNTS
     expose:
       - "\${OLLAMA_PORT}"
     restart: unless-stopped
-    networks: [ollamanet]
-$GPU_SNIPPET
-networks:
-  ollamanet:
-    driver: bridge
-YAML
-echo "• Compose written: $COMPOSE_FILE"
+    networks: [net]
+$GPU_LINE
 
-# ===== Write nginx.conf (no add_header inside 'if') =====
-cat >"$NGINX_CONF" <<'NGINX'
+  proxy:
+    image: nginx:1.25-alpine
+    container_name: ollama-proxy
+    depends_on: [ollama]
+    ports:
+$MAP_PORT
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./apikeys.conf:/etc/nginx/apikeys.conf:ro
+$TLS_MOUNTS
+    restart: unless-stopped
+    networks: [net]
+
+networks:
+  net: { driver: bridge }
+YAML
+echo "• wrote $COMPOSE"
+
+# ========= nginx.conf =========
+# این کانفیگ: بدون add_header داخل if، پشتیبانی Bearer و apikey، CORS، ریت‌لیمیت،
+# map برای استخراج توکن، و include فایل apikeys.conf (توکن -> یوزرنیم)
+cat > "$NGINX_CONF" <<'NGINX'
 worker_processes auto;
 events { worker_connections 1024; }
 http {
-  # To avoid map_hash errors for long tokens
   map_hash_max_size 4096;
   map_hash_bucket_size 128;
 
-  # Extract Bearer token
-  map $http_authorization $auth_token {
+  # combine apikey (custom header) / Authorization: Bearer
+  map $http_authorization $bearer_token {
     default "";
-    "~*^Bearer\s+(?<token>[^ ]+)$" $token;
+    "~*^Bearer\s+(?<t>[^ ]+)$" $t;
+  }
+  map $http_apikey $api_from_header { default ""; }
+  map "$api_from_header$bearer_token" $api_key_value {
+    default "$api_from_header$bearer_token";
   }
 
-  # Placeholder replaced by install.sh
-  map $auth_token $is_authorized {
-    default 0;
-    API_KEY_PLACEHOLDER 1;
-  }
+  # token -> username (valid users)  | file contains:  "token" "username";
+  map $api_key_value $api_user { default ""; include /etc/nginx/apikeys.conf; }
 
-  # Build CORS allowlist if needed (inserted by install.sh)
-  # __CORS_MAP_BLOCK__
+  # user -> authorized?
+  map $api_user $is_auth { default 0; "" 0; ~.+ 1; }
 
-  upstream ollama_upstream { server ollama:11434; }
+  # rate limit
+  limit_req_zone $binary_remote_addr zone=api:10m rate=20r/s;
 
+  upstream ollama_up { server ollama:11434; }
+
+  # ---------- HTTP ----------
   server {
     listen 8080;
 
-    # Health (no auth)
-    location = /healthz {
-      add_header Content-Type application/json;
-      return 200 '{"ok":true}';
-    }
+    # health (no auth)
+    location = /healthz { add_header Content-Type application/json; return 200 '{"ok":true}'; }
 
-    # ---- Universal CORS headers (apply to all responses) ----
-    add_header Access-Control-Allow-Origin __CORS_HEADER_VALUE__ always;
+    # CORS (global)
+    add_header Access-Control-Allow-Origin * always;
     add_header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS" always;
-    add_header Access-Control-Allow-Headers "Authorization, Content-Type" always;
+    add_header Access-Control-Allow-Headers "Authorization, Content-Type, apikey" always;
     add_header Access-Control-Allow-Credentials true always;
 
-    # ---- Secured upstream ----
-    location /ollama/ {
-      # Preflight: only return 204 (headers are already set above)
+    # OpenAI-compatible v1 (proxy as-is)
+    location ^~ /v1/ {
       if ($request_method = OPTIONS) { return 204; }
-
-      # Require Bearer token
-      if ($is_authorized = 0) {
+      if ($is_auth = 0) {
         add_header WWW-Authenticate 'Bearer realm="ollama-secure", error="invalid_token"' always;
         return 401;
       }
-
-      # Proxy
       limit_req zone=api burst=40 nodelay;
       proxy_http_version 1.1;
+      proxy_read_timeout 3600s;
       proxy_set_header Host $host;
       proxy_set_header X-Real-IP $remote_addr;
-      proxy_pass http://ollama_upstream/;
+      proxy_pass http://ollama_up;
     }
+
+    # Native Ollama REST (/api/*) اگر خواستی مستقیم بزنی
+    location ^~ /api/ {
+      if ($request_method = OPTIONS) { return 204; }
+      if ($is_auth = 0) {
+        add_header WWW-Authenticate 'Bearer realm="ollama-secure", error="invalid_token"' always;
+        return 401;
+      }
+      limit_req zone=api burst=40 nodelay;
+      proxy_http_version 1.1;
+      proxy_read_timeout 3600s;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_pass http://ollama_up;
+    }
+
+    # root check
+    location = / { return 200 "Ollama is running\n"; }
   }
 
-  # __TLS_BLOCK__
-}
-NGINX
-
-# Replace API_KEY placeholder
-api_key_escaped="$(printf '%s' "$API_KEY" | sed -e 's/[\/&]/\\&/g')"
-sed -i "s/API_KEY_PLACEHOLDER/$api_key_escaped/" "$NGINX_CONF"
-
-# Inject CORS logic
-if [[ "$ALLOWED_ORIGINS" == "*" ]]; then
-  sed -i "s/__CORS_MAP_BLOCK__//" "$NGINX_CONF"
-  sed -i "s/__CORS_HEADER_VALUE__/*/" "$NGINX_CONF"
-else
-  cors_regex="$(printf '%s' "$CORS_REGEX" | sed -e 's/[\/&]/\\&/g')"
-  CORS_MAP_BLOCK=$(cat <<EOM
-  map \$http_origin \$cors_origin {
-    default "";
-    "~*^(${cors_regex})$" \$http_origin;
-  }
-EOM
-)
-  sed -i "s#__CORS_MAP_BLOCK__#${CORS_MAP_BLOCK//$'\n'/\\n}#" "$NGINX_CONF"
-  sed -i "s/__CORS_HEADER_VALUE__/\$cors_origin/" "$NGINX_CONF"
-fi
-
-# Inject or remove TLS block
-if [[ "$ENABLE_TLS" -eq 1 ]]; then
-  TLS_BLOCK=$(cat <<'EOT'
+  # ---------- HTTPS (optional) ----------
   server {
     listen 8443 ssl;
     ssl_certificate     /etc/ssl/certs/ollama.crt;
     ssl_certificate_key /etc/ssl/private/ollama.key;
 
-    location = /healthz {
-      add_header Content-Type application/json;
-      return 200 '{"ok":true}';
-    }
+    location = /healthz { add_header Content-Type application/json; return 200 '{"ok":true}'; }
 
-    # Universal CORS headers
-    add_header Access-Control-Allow-Origin __CORS_HEADER_VALUE__ always;
+    add_header Access-Control-Allow-Origin * always;
     add_header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS" always;
-    add_header Access-Control-Allow-Headers "Authorization, Content-Type" always;
+    add_header Access-Control-Allow-Headers "Authorization, Content-Type, apikey" always;
     add_header Access-Control-Allow-Credentials true always;
 
-    location /ollama/ {
+    location ^~ /v1/ {
       if ($request_method = OPTIONS) { return 204; }
-
-      if ($is_authorized = 0) {
+      if ($is_auth = 0) {
         add_header WWW-Authenticate 'Bearer realm="ollama-secure", error="invalid_token"' always;
         return 401;
       }
-
       limit_req zone=api burst=40 nodelay;
-      proxy_http_version 1.1;
-      proxy_set_header Host $host;
-      proxy_set_header X-Real-IP $remote_addr;
-      proxy_pass http://ollama_upstream/;
+      proxy_http_version 1.1; proxy_read_timeout 3600s;
+      proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr;
+      proxy_pass http://ollama_up;
     }
+
+    location ^~ /api/ {
+      if ($request_method = OPTIONS) { return 204; }
+      if ($is_auth = 0) {
+        add_header WWW-Authenticate 'Bearer realm="ollama-secure", error="invalid_token"' always;
+        return 401;
+      }
+      limit_req zone=api burst=40 nodelay;
+      proxy_http_version 1.1; proxy_read_timeout 3600s;
+      proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr;
+      proxy_pass http://ollama_up;
+    }
+
+    location = / { return 200 "Ollama is running (TLS)\n"; }
   }
-EOT
-)
-  sed -i "s#__TLS_BLOCK__#${TLS_BLOCK//$'\n'/\\n}#" "$NGINX_CONF"
-  if [[ "$ALLOWED_ORIGINS" == "*" ]]; then
-    sed -i "s/__CORS_HEADER_VALUE__/*/g" "$NGINX_CONF"
-  else
-    sed -i "s/__CORS_HEADER_VALUE__/\$cors_origin/g" "$NGINX_CONF"
-  fi
-else
-  sed -i "s#__TLS_BLOCK__##" "$NGINX_CONF"
-  # fix any stray placeholder
-  if [[ "$ALLOWED_ORIGINS" == "*" ]]; then
-    sed -i "s/__CORS_HEADER_VALUE__/*/g" "$NGINX_CONF"
-  else
-    sed -i "s/__CORS_HEADER_VALUE__/\$cors_origin/g" "$NGINX_CONF"
-  fi
-fi
+}
+NGINX
+echo "• wrote $NGINX_CONF"
 
-echo "✅ Installation complete.
-- Env: $ENV_FILE
-- Compose: $COMPOSE_FILE
-- Nginx: $NGINX_CONF
-- Data: $OLLAMA_DATA
+# ========= apikeys.conf =========
+[[ -f "$APIKEYS" ]] || cat > "$APIKEYS" <<'AK'
+# Format: "token" "username";
+# Example:
+# "secret-1234567890abcdef" "arman";
+AK
+echo "• ensured $APIKEYS"
 
-Now run ./start.sh"
+echo "✅ Install finished. Next: ./start.sh"
